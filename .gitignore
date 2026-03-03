@@ -1,0 +1,23 @@
+# Build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+deploy-cli
+deploy-cli.exe
+
+# Local configuration overrides
+deploy.yaml
+deploy.yml
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

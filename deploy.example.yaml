@@ -1,0 +1,14 @@
+services:
+  - api-backend
+  - frontend
+  - worker
+  - database
+
+environments:
+  staging:
+    - staging-01.example.com
+    - staging-02.example.com
+  production:
+    - prod-01.example.com
+    - prod-02.example.com
+    - prod-03.example.com
