@@ -4,12 +4,12 @@ import (
 	"fmt"
 	"os"
 
-	"deploy-cli/internal/cli"
+	"github.com/Kaua-KGzin/arch-deploy/internal/cli"
 )
 
 func main() {
 	if err := cli.NewRootCommand().Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "erro: %v\n", err)
 		os.Exit(1)
 	}
 }

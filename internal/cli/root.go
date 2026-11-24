@@ -1,230 +1,342 @@
+// Package cli wires the arch-deploy commands.
 package cli
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"fmt"
-	"sort"
+	"io"
+	"net/http"
+	"os"
+	"os/signal"
 	"strings"
 	"time"
 
-	"deploy-cli/internal/config"
-	"deploy-cli/internal/deploy"
 	"github.com/spf13/cobra"
+
+	"github.com/Kaua-KGzin/arch-deploy/internal/config"
+	"github.com/Kaua-KGzin/arch-deploy/internal/engine"
+	"github.com/Kaua-KGzin/arch-deploy/internal/history"
+	"github.com/Kaua-KGzin/arch-deploy/internal/hub"
+	"github.com/Kaua-KGzin/arch-deploy/internal/provider"
 )
+
+// Version is set at build time with -ldflags "-X .../internal/cli.Version=x.y.z".
+var Version = "dev"
 
 type app struct {
 	configPath string
-	cfg        config.Config
+	out        io.Writer
+	in         io.Reader
 
-	environment string
-	parallel    bool
-	timeout     int
 	dryRun      bool
-	maxParallel int
+	yes         bool
+	all         bool
 	retries     int
-	retryDelay  time.Duration
-	failFast    bool
-
-	statusEnvironment string
-	statusShowServers bool
+	maxParallel int
+	noHub       bool
 }
 
 func NewRootCommand() *cobra.Command {
-	a := &app{}
+	return newRoot(os.Stdout, os.Stdin)
+}
 
-	rootCmd := &cobra.Command{
-		Use:          "deploy-cli",
-		Short:        "CLI de automacao de deploys",
-		Long:         "Ferramenta de linha de comando para automatizar deploys em multiplos ambientes.",
-		SilenceUsage: true,
-		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			cfg, err := config.Load(a.configPath)
-			if err != nil {
-				return err
-			}
-			a.cfg = cfg
-			return nil
+func newRoot(out io.Writer, in io.Reader) *cobra.Command {
+	a := &app{out: out, in: in}
+
+	root := &cobra.Command{
+		Use:   "arch-deploy",
+		Short: "Deploy de qualquer projeto, em qualquer lugar, com um comando",
+		Long: `arch-deploy faz o deploy de qualquer projeto: Vercel, Netlify, Cloudflare, Fly.io,
+Railway, Firebase, GitHub Pages, releases do GitHub, Docker, docker compose,
+Kubernetes, servidores proprios via SSH, deploy hooks ou qualquer comando seu.
+
+Ele usa as ferramentas que voce ja tem (vercel, docker, gh, git, ssh, kubectl...)
+e cuida do resto: plano antes de executar, hooks, varios servidores em paralelo,
+retry, health check, rollback, historico e aviso ao Arch Hub.
+
+Comece com:  arch-deploy init`,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Version:       Version,
+	}
+	root.SetOut(a.out)
+	root.PersistentFlags().StringVarP(&a.configPath, "config", "c", "", "arquivo de configuracao (padrao: arch-deploy.yaml)")
+
+	root.AddCommand(
+		a.initCommand(),
+		a.deployCommand(),
+		a.planCommand(),
+		a.rollbackCommand(),
+		a.targetsCommand(),
+		a.doctorCommand(),
+		a.historyCommand(),
+		a.validateCommand(),
+		a.providersCommand(),
+	)
+	return root
+}
+
+func (a *app) load() (*config.Config, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	path, err := config.Find(a.configPath, cwd)
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := provider.ValidateConfig(cfg); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func (a *app) deployCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "deploy [target...]",
+		Short: "Faz o deploy de um ou mais targets",
+		Example: `  arch-deploy deploy production
+  arch-deploy deploy staging production --yes
+  arch-deploy deploy --all --dry-run`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runDeploy(args, a.dryRun)
 		},
 	}
-
-	rootCmd.PersistentFlags().StringVarP(&a.configPath, "config", "c", "deploy.yaml", "Caminho do arquivo de configuracao")
-
-	deployCmd := &cobra.Command{
-		Use:   "deploy [service]",
-		Short: "Executa o deploy de um servico",
-		Args:  cobra.ExactArgs(1),
-		RunE:  a.runDeploy,
-	}
-	a.addDeployFlags(deployCmd)
-
-	planCmd := &cobra.Command{
-		Use:   "plan [service]",
-		Short: "Mostra o plano de deploy sem executar alteracoes",
-		Args:  cobra.ExactArgs(1),
-		RunE:  a.runPlan,
-	}
-	a.addDeployFlags(planCmd)
-
-	statusCmd := &cobra.Command{
-		Use:   "status",
-		Short: "Mostra servicos cadastrados e inventario de ambientes",
-		RunE:  a.runStatus,
-	}
-	statusCmd.Flags().StringVarP(&a.statusEnvironment, "env", "e", "", "Filtra o status por ambiente")
-	statusCmd.Flags().BoolVar(&a.statusShowServers, "show-servers", true, "Mostra a lista de servidores em cada ambiente")
-
-	validateConfigCmd := &cobra.Command{
-		Use:   "validate-config",
-		Short: "Valida o arquivo de configuracao carregado",
-		RunE:  a.runValidateConfig,
-	}
-
-	rootCmd.AddCommand(deployCmd, planCmd, statusCmd, validateConfigCmd)
-	return rootCmd
+	cmd.Flags().BoolVar(&a.dryRun, "dry-run", false, "mostra os comandos sem executar")
+	a.addRunFlags(cmd)
+	cmd.Flags().BoolVar(&a.all, "all", false, "todos os targets")
+	return cmd
 }
 
-func (a *app) addDeployFlags(cmd *cobra.Command) {
-	cmd.Flags().StringVarP(&a.environment, "env", "e", "staging", "Ambiente de destino")
-	cmd.Flags().BoolVarP(&a.parallel, "parallel", "p", false, "Executa em paralelo")
-	cmd.Flags().IntVarP(&a.timeout, "timeout", "t", 300, "Timeout total em segundos")
-	cmd.Flags().BoolVar(&a.dryRun, "dry-run", false, "Mostra etapas sem executar alteracoes")
-	cmd.Flags().IntVar(&a.maxParallel, "max-parallel", 4, "Numero maximo de deploys simultaneos no modo paralelo")
-	cmd.Flags().IntVar(&a.retries, "retries", 1, "Numero de tentativas adicionais por servidor")
-	cmd.Flags().DurationVar(&a.retryDelay, "retry-delay", 2*time.Second, "Intervalo base entre tentativas (ex.: 2s, 500ms)")
-	cmd.Flags().BoolVar(&a.failFast, "fail-fast", false, "Interrompe o deploy ao primeiro erro")
+func (a *app) planCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "plan [target...]",
+		Short: "Mostra exatamente o que o deploy vai executar, sem executar",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			a.yes = true
+			return a.runDeploy(args, true)
+		},
+	}
+	cmd.Flags().BoolVar(&a.all, "all", false, "todos os targets")
+	return cmd
 }
 
-func (a *app) runDeploy(cmd *cobra.Command, args []string) error {
-	service, err := config.ResolveServiceName(args[0], a.cfg.Services)
-	if err != nil {
-		return err
-	}
-
-	opts, err := a.buildDeployOptions()
-	if err != nil {
-		return err
-	}
-
-	plan, err := deploy.BuildPlan(service, a.environment, a.cfg.Environments, opts)
-	if err != nil {
-		return err
-	}
-
-	fmt.Printf("Iniciando deploy de %s no ambiente %s\n", plan.Service, plan.Environment)
-	fmt.Printf("Alvos (%d): %s\n", len(plan.Servers), strings.Join(plan.Servers, ", "))
-	if plan.DryRun {
-		fmt.Println("Modo dry-run ativo: nenhuma alteracao sera aplicada.")
-	}
-	if plan.Parallel {
-		fmt.Printf("Modo paralelo ativo (max-parallel=%d)\n", plan.MaxParallel)
-	} else {
-		fmt.Println("Modo sequencial ativo")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), plan.Timeout)
-	defer cancel()
-
-	summary, execErr := deploy.Execute(ctx, plan, opts)
-	deploy.PrintSummary(summary)
-	return execErr
+func (a *app) addRunFlags(cmd *cobra.Command) {
+	cmd.Flags().BoolVarP(&a.yes, "yes", "y", false, "nao pede confirmacao (targets com confirm: true)")
+	cmd.Flags().IntVar(&a.retries, "retries", 0, "tentativas extras por unidade (sobrescreve o target)")
+	cmd.Flags().IntVar(&a.maxParallel, "max-parallel", 0, "unidades em paralelo (sobrescreve o target)")
+	cmd.Flags().BoolVar(&a.noHub, "no-hub", false, "nao avisa o Arch Hub")
 }
 
-func (a *app) runPlan(cmd *cobra.Command, args []string) error {
-	service, err := config.ResolveServiceName(args[0], a.cfg.Services)
-	if err != nil {
-		return err
+func (a *app) targetsFrom(cfg *config.Config, args []string) ([]string, error) {
+	if a.all {
+		return cfg.TargetNames(), nil
 	}
-
-	opts, err := a.buildDeployOptions()
-	if err != nil {
-		return err
+	if len(args) > 0 {
+		return args, nil
 	}
-
-	plan, err := deploy.BuildPlan(service, a.environment, a.cfg.Environments, opts)
-	if err != nil {
-		return err
+	if len(cfg.Targets) == 1 {
+		return cfg.TargetNames(), nil
 	}
-
-	deploy.PrintPlan(plan)
-	return nil
+	return nil, fmt.Errorf("escolha um target: %s (ou --all)", strings.Join(cfg.TargetNames(), ", "))
 }
 
-func (a *app) runStatus(cmd *cobra.Command, args []string) error {
-	fmt.Println("Servicos cadastrados")
-	fmt.Println("--------------------")
-	services := make([]string, 0, len(a.cfg.Services))
-	services = append(services, a.cfg.Services...)
-	sort.Strings(services)
-	for _, service := range services {
-		fmt.Printf("- %s\n", service)
-	}
-
-	environments, err := config.FilterEnvironments(a.statusEnvironment, a.cfg.Environments)
+func (a *app) runDeploy(args []string, dryRun bool) error {
+	cfg, err := a.load()
 	if err != nil {
 		return err
 	}
-
-	envNames := make([]string, 0, len(environments))
-	for envName := range environments {
-		envNames = append(envNames, envName)
+	names, err := a.targetsFrom(cfg, args)
+	if err != nil {
+		return err
 	}
-	sort.Strings(envNames)
-
-	fmt.Println()
-	fmt.Println("Inventario de ambientes")
-	fmt.Println("-----------------------")
-	for _, envName := range envNames {
-		servers := environments[envName]
-		fmt.Printf("- %s (%d servidor(es))\n", envName, len(servers))
-		if a.statusShowServers {
-			for _, server := range servers {
-				fmt.Printf("  - %s\n", server)
-			}
+	for _, name := range names {
+		if _, ok := cfg.Targets[name]; !ok {
+			return fmt.Errorf("target %q nao existe (disponiveis: %s)", name, strings.Join(cfg.TargetNames(), ", "))
 		}
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	failed := 0
+	for _, name := range names {
+		t := cfg.Targets[name]
+		if t.Confirm && !dryRun && !a.yes {
+			if err := a.confirm(name); err != nil {
+				return err
+			}
+		}
+		res := engine.Deploy(ctx, cfg, name, a.options(dryRun))
+		a.printResult(res)
+		if !dryRun {
+			a.record(cfg, res)
+			if res.OK() {
+				a.notifyHub(ctx, cfg)
+			}
+		}
+		if !res.OK() {
+			failed++
+			if ctx.Err() != nil {
+				break
+			}
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d de %d target(s) falharam", failed, len(names))
+	}
 	return nil
 }
 
-func (a *app) runValidateConfig(cmd *cobra.Command, args []string) error {
-	source := "defaults internos"
-	if path, ok, err := config.FirstExistingPath(config.ResolveCandidates(a.configPath)); err != nil {
-		return err
-	} else if ok {
-		source = path
+func (a *app) rollbackCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "rollback <target>",
+		Short: "Volta o target para a versao anterior",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := a.load()
+			if err != nil {
+				return err
+			}
+			name := args[0]
+			t, ok := cfg.Targets[name]
+			if !ok {
+				return fmt.Errorf("target %q nao existe", name)
+			}
+			if t.Confirm && !a.dryRun && !a.yes {
+				if err := a.confirm(name); err != nil {
+					return err
+				}
+			}
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+			defer stop()
+			res := engine.Rollback(ctx, cfg, name, a.options(a.dryRun))
+			a.printResult(res)
+			if !a.dryRun {
+				a.record(cfg, res)
+				if res.OK() {
+					a.notifyHub(ctx, cfg)
+				}
+			}
+			if !res.OK() {
+				return res.Err
+			}
+			return nil
+		},
 	}
-
-	envNames := make([]string, 0, len(a.cfg.Environments))
-	for envName := range a.cfg.Environments {
-		envNames = append(envNames, envName)
-	}
-	sort.Strings(envNames)
-
-	fmt.Println("Configuracao valida")
-	fmt.Println("-------------------")
-	fmt.Printf("Fonte: %s\n", source)
-	fmt.Printf("Servicos: %d\n", len(a.cfg.Services))
-	fmt.Printf("Ambientes: %d\n", len(a.cfg.Environments))
-	for _, envName := range envNames {
-		fmt.Printf("- %s: %d servidor(es)\n", envName, len(a.cfg.Environments[envName]))
-	}
-
-	return nil
+	cmd.Flags().BoolVar(&a.dryRun, "dry-run", false, "mostra os comandos sem executar")
+	a.addRunFlags(cmd)
+	return cmd
 }
 
-func (a *app) buildDeployOptions() (deploy.Options, error) {
-	opts := deploy.Options{
-		Parallel:    a.parallel,
-		MaxParallel: a.maxParallel,
-		Timeout:     time.Duration(a.timeout) * time.Second,
-		DryRun:      a.dryRun,
+func (a *app) options(dryRun bool) engine.Options {
+	return engine.Options{
+		DryRun:      dryRun,
+		Out:         a.out,
 		Retries:     a.retries,
-		RetryDelay:  a.retryDelay,
-		FailFast:    a.failFast,
-		Verbose:     true,
+		MaxParallel: a.maxParallel,
 	}
-	if err := opts.Validate(); err != nil {
-		return deploy.Options{}, err
+}
+
+func (a *app) confirm(name string) error {
+	if f, ok := a.in.(*os.File); ok {
+		if info, err := f.Stat(); err == nil && info.Mode()&os.ModeCharDevice == 0 {
+			return fmt.Errorf("o target %q pede confirmacao: rode com --yes em scripts/CI", name)
+		}
 	}
-	return opts, nil
+	fmt.Fprintf(a.out, "Deploy em %q. Digite o nome do target para confirmar: ", name)
+	line, err := bufio.NewReader(a.in).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	if strings.TrimSpace(line) != name {
+		return errors.New("cancelado")
+	}
+	return nil
+}
+
+func (a *app) printResult(res engine.Result) {
+	if res.DryRun && res.OK() {
+		fmt.Fprintf(a.out, "<== plano de %s ok\n\n", res.Target)
+		return
+	}
+	status := "OK"
+	if !res.OK() {
+		status = "FALHOU"
+	}
+	fmt.Fprintf(a.out, "<== %s %s %s em %s", res.Action, res.Target, status, res.Duration.Round(100*time.Millisecond))
+	if res.RolledBack {
+		fmt.Fprint(a.out, " (rollback automatico feito)")
+	}
+	fmt.Fprintln(a.out)
+	if len(res.Units) > 1 {
+		for _, u := range res.Units {
+			state := "ok"
+			switch {
+			case u.Skipped:
+				state = "pulado"
+			case u.Err != nil:
+				state = "falhou: " + u.Err.Error()
+			}
+			fmt.Fprintf(a.out, "    %-28s %s (tentativas: %d, %s)\n", u.Unit, state, u.Attempts, u.Duration.Round(100*time.Millisecond))
+		}
+	}
+	if res.Err != nil {
+		fmt.Fprintf(a.out, "    erro: %v\n", res.Err)
+	}
+	fmt.Fprintln(a.out)
+}
+
+func (a *app) record(cfg *config.Config, res engine.Result) {
+	entry := history.Entry{
+		Time:       res.Started,
+		Target:     res.Target,
+		Provider:   res.Provider,
+		Action:     res.Action,
+		Version:    res.Version,
+		Commit:     res.Commit,
+		OK:         res.OK(),
+		DurationMS: res.Duration.Milliseconds(),
+		RolledBack: res.RolledBack,
+		User:       currentUser(),
+	}
+	if res.Err != nil {
+		entry.Error = res.Err.Error()
+	}
+	for _, u := range res.Units {
+		entry.Units = append(entry.Units, u.Unit)
+	}
+	if err := history.Append(cfg.Dir, entry); err != nil {
+		fmt.Fprintf(a.out, "aviso: nao consegui gravar o historico: %v\n", err)
+	}
+}
+
+func (a *app) notifyHub(ctx context.Context, cfg *config.Config) {
+	if a.noHub {
+		return
+	}
+	settings, ok := hub.Resolve(cfg)
+	if !ok {
+		return
+	}
+	if err := hub.Heartbeat(ctx, &http.Client{Timeout: 10 * time.Second}, settings); err != nil {
+		fmt.Fprintf(a.out, "aviso: Arch Hub nao recebeu o aviso: %v\n", err)
+		return
+	}
+	fmt.Fprintf(a.out, "Arch Hub avisado (%s)\n", settings.System)
+}
+
+func currentUser() string {
+	for _, k := range []string{"USER", "USERNAME"} {
+		if v := os.Getenv(k); v != "" {
+			return v
+		}
+	}
+	return ""
 }

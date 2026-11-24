@@ -6,12 +6,11 @@
 *.test
 *.out
 coverage.out
-deploy-cli
-deploy-cli.exe
+/arch-deploy
+/dist/
 
-# Local configuration overrides
-deploy.yaml
-deploy.yml
+# arch-deploy local state (history, gh-pages scratch repo)
+.arch-deploy/
 
 # IDE / editor
 .vs/
