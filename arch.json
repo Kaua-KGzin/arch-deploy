@@ -1,0 +1,13 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Kaua-KGzin/System-Arch/main/docs/arch-line.schema.json",
+  "line": "arch",
+  "protocol": 1,
+  "id": "arch-deploy",
+  "name": "arch-deploy",
+  "role": "platform",
+  "description": "Deploy de qualquer projeto, em qualquer lugar, com um comando: plano, hooks, health check e rollback sobre as CLIs que voce ja usa.",
+  "repository": "https://github.com/Kaua-KGzin/arch-deploy",
+  "stack": ["go"],
+  "runtime": "static",
+  "connectsTo": []
+}
